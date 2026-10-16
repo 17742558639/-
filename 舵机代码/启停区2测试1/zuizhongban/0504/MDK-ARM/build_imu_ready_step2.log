@@ -1,0 +1,15 @@
+*** Using Compiler 'V5.06 update 5 (build 528)', folder: 'C:\Keil_v5\ARM\ARMCC\Bin'
+Build target 'test1'
+compiling move.c...
+..\Models\Src\move.c(845): warning:  #111-D: statement is unreachable
+  					break;
+..\Models\Src\move.c(849): warning:  #111-D: statement is unreachable
+  					break;
+..\Models\Src\move.c(853): warning:  #111-D: statement is unreachable
+  					break;
+..\Models\Src\move.c: 3 warnings, 0 errors
+linking...
+Program Size: Code=27900 RO-data=504 RW-data=488 ZI-data=4472  
+FromELF: creating hex file...
+"test1\test1.axf" - 0 Error(s), 3 Warning(s).
+Build Time Elapsed:  00:00:07

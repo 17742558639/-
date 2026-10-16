@@ -1,0 +1,30 @@
+*** Using Compiler 'V5.06 update 5 (build 528)', folder: 'C:\Keil_v5\ARM\ARMCC\Bin'
+Build target 'test1'
+compiling pid.c...
+compiling task.c...
+compiling stm32f4xx_it.c...
+compiling servo.c...
+..\Models\Src\servo.c(426): warning:  #186-D: pointless comparison of unsigned integer with zero
+    for(uint8_t i = 0;i < 
+OINT3_MOVE - 
+OINT3_WATCH;i +=2)
+..\Models\Src\servo.c(439): warning:  #186-D: pointless comparison of unsigned integer with zero
+    for(uint8_t i = 0;i < 
+OINT3_MOVE - 
+OINT3_WATCH;i +=2)
+..\Models\Src\servo.c: 2 warnings, 0 errors
+compiling camera.c...
+compiling main.c...
+compiling move.c...
+..\Models\Src\move.c(898): warning:  #111-D: statement is unreachable
+  					break;
+..\Models\Src\move.c(902): warning:  #111-D: statement is unreachable
+  					break;
+..\Models\Src\move.c(906): warning:  #111-D: statement is unreachable
+  					break;
+..\Models\Src\move.c: 3 warnings, 0 errors
+linking...
+Program Size: Code=20588 RO-data=504 RW-data=484 ZI-data=4476  
+FromELF: creating hex file...
+"test1\test1.axf" - 0 Error(s), 5 Warning(s).
+Build Time Elapsed:  00:00:04

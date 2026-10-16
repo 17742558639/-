@@ -1,0 +1,962 @@
+#include "move.h"
+#include <math.h>
+
+/*
+电机ID：
+
+	^y
+	|
+	|	3   前   1
+	|
+	|
+	|	2        4
+	----------------->x
+	顺时针 +
+
+	x: 146cm   5.9s  60=24.7cm/s
+	y: 17cm	   0.7s	 60=24.3cm/s
+
+*/
+
+__IO uint8_t MoveCmd[Move_CMD] = {0};
+__IO uint8_t MoveCount = 0;
+
+extern DMA_HandleTypeDef hdma_usart1_rx;
+extern DMA_HandleTypeDef hdma_usart1_tx;
+extern UART_HandleTypeDef huart1;
+
+xMOVE pxMove;
+xMOVETAR pxMoveTar;
+
+uint32_t my_abs(int data)
+{
+	if(data < 0) return -data;
+	else return data;
+}
+
+/* 自转函数声明 */
+void Rotate(uint16_t angle_deg, uint8_t dir);
+void Move_Init(void)
+{
+	__HAL_UART_CLEAR_IDLEFLAG(&huart1);
+	__HAL_UART_ENABLE_IT(&huart1, UART_IT_IDLE);
+	HAL_UART_Receive_DMA(&huart1, (uint8_t *)MoveCmd, Move_CMD);
+	HAL_Delay(2000);
+
+	/* --- 清TC + 等电机准备好 --- */
+	__HAL_UART_CLEAR_FLAG(&huart1, UART_FLAG_TC);
+	HAL_Delay(100);
+
+	/* --- 强制切4个电机到串口模式 + 保存Flash --- */
+	Emm_V5_Modify_Ctrl_Mode(1, true, 0);
+	while (!__HAL_UART_GET_FLAG(&huart1, UART_FLAG_TC));
+	Emm_V5_Modify_Ctrl_Mode(2, true, 0);
+	while (!__HAL_UART_GET_FLAG(&huart1, UART_FLAG_TC));
+	Emm_V5_Modify_Ctrl_Mode(3, true, 0);
+	while (!__HAL_UART_GET_FLAG(&huart1, UART_FLAG_TC));
+	Emm_V5_Modify_Ctrl_Mode(4, true, 0);
+	while (!__HAL_UART_GET_FLAG(&huart1, UART_FLAG_TC));
+
+	/* --- 使能4个电机 --- */
+	Emm_V5_En_Control(1, true, false);
+	while (!__HAL_UART_GET_FLAG(&huart1, UART_FLAG_TC));
+	Emm_V5_En_Control(2, true, false);
+	while (!__HAL_UART_GET_FLAG(&huart1, UART_FLAG_TC));
+	Emm_V5_En_Control(3, true, false);
+	while (!__HAL_UART_GET_FLAG(&huart1, UART_FLAG_TC));
+	Emm_V5_En_Control(4, true, false);
+	while (!__HAL_UART_GET_FLAG(&huart1, UART_FLAG_TC));
+
+
+	/*
+	 * === 测试路径（已禁用）=== 
+	 * 需要测试时取消注释
+	RunMove(FRONT, 114, 0);
+	RunMove(LEFT,  105, 0);
+	...
+	RunMove(LEFT, 188, 0);
+	 */
+}
+
+/* ============================================================
+   自转函数 —— 用 Pos_Control 原地旋转
+   实测：2000脉冲=45° → 1°≈44.4脉冲 → 180°≈8000脉冲
+   dir: 0=顺时针(CW), 1=逆时针(CCW)
+   ============================================================ */
+void Rotate(uint16_t angle_deg, uint8_t dir)
+{
+	uint32_t pulses = (uint32_t)((float)angle_deg * 53.33f);
+
+	HAL_Delay(50);
+	__HAL_UART_CLEAR_FLAG(&huart1, UART_FLAG_TC);
+
+	for (uint8_t i = 0; i < 4; i++)
+	{
+		Emm_V5_Pos_Control(i + 1, dir, 50, 5, pulses, 0, 0);
+		HAL_Delay(10);
+	}
+
+	// 速度50RPM=0.83圈/秒 → 时间(ms) = 脉冲数/(3200×0.83)×1000 ≈ 脉冲数/2667×1000
+	uint32_t wait_ms = (uint32_t)((float)pulses / 2667.0f * 1000.0f) + 400;
+	HAL_Delay(wait_ms);
+}
+
+void Move_Idle_Func(void)
+{
+	if(__HAL_UART_GET_FLAG(&huart1, UART_FLAG_IDLE) != RESET)
+	{
+		__HAL_UART_CLEAR_IDLEFLAG(&huart1);
+		HAL_UART_DMAStop(&huart1);
+		MoveCount = __HAL_DMA_GET_COUNTER(&hdma_usart1_rx);
+		HAL_UART_Receive_DMA(&huart1, (uint8_t *)MoveCmd, Move_CMD);
+	}
+}
+
+
+static void RotateMoveTarSet(int omega)
+{
+	pxMoveTar.acc = 0;
+	pxMoveTar.x = 0;
+	pxMoveTar.y = 0;
+	pxMoveTar.omega = omega;
+}
+
+static void RunMoveTarSet(int x,int y)
+{
+	pxMoveTar.acc = 0;
+	pxMoveTar.x = x;
+	pxMoveTar.y = y;
+	pxMoveTar.omega = pidout_i(&imu_pid,yaw);
+}
+
+static void MoveTarClear(void)
+{
+	pxMoveTar.x = 0;
+	pxMoveTar.y = 0;
+	pxMoveTar.omega = 0;
+}
+
+static void MoveSolve(void)
+{
+	int w[4];
+
+	w[0] =  pxMoveTar.y - pxMoveTar.x - pxMoveTar.omega;
+	w[1] =  -pxMoveTar.y + pxMoveTar.x - pxMoveTar.omega;
+	w[2] = (-1) * (pxMoveTar.y + pxMoveTar.x + pxMoveTar.omega);
+	w[3] = (-1) * (-pxMoveTar.y - pxMoveTar.x + pxMoveTar.omega);
+
+	for(uint8_t i = 0;i < 4;i++)
+	{
+		if(w[i]<0)
+		{
+			pxMove.dir[i] = 0;
+			w[i] *= -1;
+		}else pxMove.dir[i] = 1;
+		pxMove.vel[i] = w[i];
+	}
+	pxMove.acc = pxMoveTar.acc;
+
+	for(uint8_t i = 0;i < 4;i++)
+	{
+		Emm_V5_Vel_Control(i+1, pxMove.dir[i], pxMove.vel[i], pxMove.acc, 0);  // snF=0 立即执行
+		HAL_Delay(5);
+	}
+}
+
+void Stop(void)
+{
+	MoveTarClear();
+	MoveSolve();
+}
+
+void RotateMove(int omega)
+{
+	RotateMoveTarSet(omega);
+	MoveSolve();
+}
+/*
+ * ============================================================
+ *  【新版】位置模式闭环走 —— 告诉电机"转多少脉冲"，电机自己数
+ *   原理：不再发速度指令+掐表，而是直接发位置指令
+ *   电机内部有编码器，自己知道转了多少，转到目标自动停
+ *
+ *   换算公式：
+ *     目标脉冲 = 距离(cm) ÷ (π × 轮子直径) × 每圈脉冲数
+ *
+ *   举例：向前走 50cm
+ *     轮子周长 = 3.14159 × 8 = 25.13cm
+ *     需要转 50 ÷ 25.13 ≈ 2 圈
+ *     每圈 1600 脉冲(200整步×8细分) → 2 × 1600 = 3200 脉冲
+ *     告诉电机"你转 3200 个脉冲"，电机内部闭环执行
+ * ============================================================
+ */
+void RunMove(uint8_t dir, uint16_t distance, uint8_t isrunmap)
+{
+	/* --- 清TC标志，防上次残留导致指令碰撞 --- */
+	__HAL_UART_CLEAR_FLAG(&huart1, UART_FLAG_TC);
+
+	/* --- 第1步：把厘米换算成脉冲数 --- */
+	uint32_t pulses = CM_TO_PULSES(distance);
+
+	/* --- 第2步：判断方向（和旧版逻辑一致）--- */
+	int x_sign = 0;   // x方向符号：+1=右, -1=左, 0=不沿x走
+	int y_sign = 0;   // y方向符号：+1=前, -1=后, 0=不沿y走
+
+	if(isrunmap)
+	{
+		/* 地图模式：先旋转车身对准地图方向，再沿车体x轴直线走 */
+		switch (dir)
+		{
+			case RIGHT:
+				Rotation(0);    // 车身回正（yaw=0），面朝地图+y
+				x_sign =  1;    // 车体坐标下向右
+				y_sign =  0;
+				break;
+
+			case LEFT:
+				Rotation(0);    // 车身回正
+				x_sign = -1;    // 车体坐标下向左
+				y_sign =  0;
+				break;
+
+			case FRONT:
+				Rotation(-90);  // 车身右转90度，面朝地图+x
+				x_sign = -1;    // 地图"前"=车体坐标下向左
+				y_sign =  0;
+				break;
+
+			case BACK:
+				Rotation(-90);  // 车身右转90度
+				x_sign =  1;    // 地图"后"=车体坐标下向右
+				y_sign =  0;
+				break;
+		}
+	}
+	else
+	{
+		/* 普通模式：直接在车体坐标系下走 */
+		switch (dir)
+		{
+			case RIGHT:
+				x_sign =  1;    // 车体坐标向右
+				y_sign =  0;
+				break;
+
+			case LEFT:
+				x_sign = -1;    // 车体坐标向左
+				y_sign =  0;
+				break;
+
+			case FRONT:
+				x_sign =  0;
+				y_sign =  1;    // 车体坐标向前
+				break;
+
+			case BACK:
+				x_sign =  0;
+				y_sign = -1;    // 车体坐标向后
+				break;
+		}
+	}
+
+	/* --- 第3步：麦克纳姆轮分解 ---
+	   把"车子往哪个方向走"翻译成"4个轮子各自往哪转"
+
+	   轮子编号（俯视图）：
+	         ↑ y(前)
+	         |
+	    ③   |   ①
+	         |
+	   ------+------→ x(右)
+	         |
+	    ②   |   ④
+	         |
+
+	   公式：
+	     w1 =  y - x      1号轮：前+左 为正转
+	     w2 = -y + x      2号轮：后+右 为正转
+	     w3 = -(y + x)    3号轮：前+右 为反转（取负）
+	     w4 = -(-y - x)   4号轮：后+左 为反转（取负）
+
+	   举例：纯前进（y_sign=1, x_sign=0）
+	     w1 =  1  →  正转
+	     w2 = -1  →  反转
+	     w3 = -1  →  反转
+	     w4 =  1  →  正转
+	     四个轮同速，1和4正转、2和3反转 → 车直直往前走
+
+	   举例：纯右移（y_sign=0, x_sign=1）
+	     w1 = -1  →  反转
+	     w2 =  1  →  正转
+	     w3 = -1  →  反转
+	     w4 =  1  →  正转
+	     四个轮同速，2和4正转、1和3反转 → 车横着右移
+	   -------------------------------------------------------- */
+	int w[4];   // 四个轮子的转动方向和幅度（+正转，-反转）
+	w[0] =  y_sign - x_sign;        // 1号轮
+	w[1] = -y_sign + x_sign;        // 2号轮
+	w[2] = -(y_sign + x_sign);      // 3号轮
+	w[3] = -(-y_sign - x_sign);     // 4号轮
+
+	/* --- 第4步：记下出发朝向，走完后校准 --- */
+	short ref_yaw = yaw;
+
+	/* --- 第5步：给4个电机发位置指令 --- */
+	HAL_Delay(50);
+
+	for (uint8_t i = 0; i < 4; i++)
+	{
+		uint8_t dir_cmd = (w[i] >= 0) ? 0 : 1;
+		Emm_V5_Pos_Control(i + 1,
+		                   dir_cmd,
+		                   RUNMOVE_VEL,
+		                   5,
+		                   pulses,
+		                   0,
+		                   0);
+		HAL_Delay(10);
+	}
+
+	/* --- 第6步：等待走完 --- */
+	uint32_t wait_ms = (uint32_t)((float)pulses / (float)PULSES_PER_REV * 1000.0f) + 200;
+	HAL_Delay(wait_ms);
+
+	/* --- 第7步：陀螺仪校准 —— 走完后方向偏了就修正 --- */
+	HAL_Delay(80);
+	if (my_abs(ref_yaw - yaw) > 2)
+	{
+		Rotation(ref_yaw);  // IMU闭环修正回出发时的朝向
+	}
+}
+
+void PidMove(int x,int y)
+{
+	RunMoveTarSet(x,y);
+	MoveSolve();
+}
+
+/*
+ * ============================================================
+ *  带IMU实时修正的直线移动（仿冠军 Chassis_MoveOnce）
+ *  跟 RunMove 的区别：
+ *    RunMove：发位置指令 → 掐表等 → 走完检查IMU → 歪了再修
+ *    本函数：发速度指令 → 每30ms读IMU → 歪了立刻修 → 全程闭环
+ * ============================================================
+ */
+void RunMoveWithIMU(uint8_t dir, uint16_t distance)
+{
+	int x_sign = 0, y_sign = 0;
+
+	/* --- 第1步：方向分解 --- */
+	switch (dir)
+	{
+		case FRONT: x_sign =  0; y_sign =  1; break;
+		case BACK:  x_sign =  0; y_sign = -1; break;
+		case LEFT:  x_sign = -1; y_sign =  0; break;
+		case RIGHT: x_sign =  1; y_sign =  0; break;
+	}
+
+	/* --- 第2步：估算走多久 ---
+	   40 RPM = 0.67圈/秒，轮子周长 25.13cm，车速 ≈ 16.7cm/s
+	   时间(ms) = 距离(cm) ÷ 16.7 × 1000
+	   -------------------------------------------------------- */
+	int max_speed = 40;  /* 40 RPM，比位置模式慢一点，平稳 */
+	float speed_cm_per_s = WHEEL_CIRCUMFERENCE * (float)max_speed / 60.0f;
+	uint32_t duration_ms = (uint32_t)((float)distance / speed_cm_per_s * 1000.0f);
+	uint32_t accel_ms   = 200;   /* 加速段时间 200ms */
+	uint32_t decel_ms   = 200;   /* 减速段时间 200ms */
+	uint32_t const_ms;
+
+	if (duration_ms > accel_ms + decel_ms)
+		const_ms = duration_ms - accel_ms - decel_ms;
+	else
+	{
+		/* 距离太短，加减速各占一半，没有匀速段 */
+		accel_ms = duration_ms / 2;
+		decel_ms = duration_ms - accel_ms;
+		const_ms = 0;
+	}
+
+	/* --- 第3步：记下出发朝向，设IMU目标 --- */
+	short ref_yaw = yaw;
+	imu_pid.desired = ref_yaw;
+	IMUPidClear();
+
+	uint32_t dt = 30;  /* 每30ms修正一次 */
+
+	/* --- 第4步：加速段（正弦曲线，平滑起步）--- */
+	uint32_t accel_steps = accel_ms / dt;
+	if (accel_steps > 0)
+	{
+		for (uint32_t i = 0; i < accel_steps; i++)
+		{
+			float ratio = 0.5f - 0.5f * cosf(3.14159f * (float)i / (float)accel_steps);
+			int vx = (int)((float)(x_sign * max_speed) * ratio);
+			int vy = (int)((float)(y_sign * max_speed) * ratio);
+			PidMove(vx, vy);   /* IMU PID 在 PidMove 内部自动生效 */
+			HAL_Delay(dt);
+		}
+	}
+
+	/* --- 第5步：匀速段（IMU全程盯着）--- */
+	uint32_t const_steps = const_ms / dt;
+	for (uint32_t i = 0; i < const_steps; i++)
+	{
+		PidMove(x_sign * max_speed, y_sign * max_speed);
+		HAL_Delay(dt);
+	}
+
+	/* --- 第6步：减速段（正弦曲线，平滑停车）--- */
+	uint32_t decel_steps = decel_ms / dt;
+	if (decel_steps > 0)
+	{
+		for (uint32_t i = 0; i < decel_steps; i++)
+		{
+			float ratio = 0.5f + 0.5f * cosf(3.14159f * (float)i / (float)decel_steps);
+			int vx = (int)((float)(x_sign * max_speed) * ratio);
+			int vy = (int)((float)(y_sign * max_speed) * ratio);
+			PidMove(vx, vy);
+			HAL_Delay(dt);
+		}
+	}
+
+	/* --- 第7步：停车 --- */
+	Stop();
+
+	/* --- 第8步：最后校准 --- */
+	HAL_Delay(80);
+	if (my_abs(ref_yaw - yaw) > 2)
+	{
+		Rotation(ref_yaw);
+	}
+}
+
+/*
+ * === 旧版：速度模式+PID自转（已弃用）===
+ * 问题：依赖 Vel_Control，1号电机不响应速度指令，自转失败
+void Rotation_OLD(short angle_desired)
+{
+	int omega = 0;
+	float pidout_imu = 0;
+	uint8_t wait_index = 0;
+
+	yaw_desired = angle_desired;
+	imu_pid.desired = yaw_desired;
+
+	while(wait_index < 10)
+	{
+		if(my_abs(yaw - yaw_desired) > 1)
+		{
+			wait_index = 0;
+			pidout_imu = pidout_i(&imu_pid,yaw);
+			omega = (int)pidout_imu;
+			RotateMove(omega);
+			HAL_Delay(10);
+		}else
+		{
+			wait_index++;
+			HAL_Delay(20);
+		}
+	}
+	Stop();
+}
+ * === 新版：陀螺仪闭环自转 ===
+ * 读IMU角度 → 算误差 → 用Rotate(Pos_Control)逐步修正 → 到位停
+ * 优点：不打滑、不受电压影响、自动补偿
+ */
+
+void Rotation(short angle_desired)
+{
+	short error;
+	short yaw_start, yaw_after;
+	uint8_t stable_cnt = 0;
+	uint16_t step;
+	uint8_t dir;
+	static uint8_t imu_ok = 0;        // static记忆,第一次检测后保存结果
+
+	yaw_desired = angle_desired;
+	HAL_Delay(50);
+
+	/* --- 首次调用时检测IMU是否在工作 --- */
+	if (imu_ok == 0)
+	{
+		yaw_start = yaw;
+		Rotate(5, 0);                 // 转5°试试，确保IMU能检测到变化
+		yaw_after = yaw;
+
+		if (my_abs(yaw_after - yaw_start) > 2)
+				imu_ok = 1;               // IMU正常
+		else
+			imu_ok = 2;               // IMU无效,走计时模式
+	}
+
+	if (imu_ok == 1)
+	{
+		/* === IMU闭环模式 === */
+		short last_error = 0;
+
+		while (stable_cnt < 5)
+		{
+			error = yaw_desired - yaw;
+
+			if (my_abs(error) > 2)       // 容差±2°，转不到位不舒服
+			{
+				stable_cnt = 0;
+
+				/* yaw=CCW+，车=CW+，方向取反：error>0→需CCW→dir=1(CCW) */
+				dir = (error > 0) ? 1 : 0;
+
+				/* 自适应步长：大步追、小步调 */
+				if (last_error != 0 && ((error > 0) != (last_error > 0)))
+					step = (uint16_t)((float)my_abs(error) * 0.3f);  // 冲过头了，30%慢慢回
+				else
+					step = (uint16_t)((float)my_abs(error) * 0.6f);  // 正常追，60%修正
+
+				if (step < 2)  step = 2;    // 最小2°，精细修正
+				if (step > 45) step = 45;   // 最多45°，大步走不卡顿
+
+				last_error = error;
+				Rotate(step, dir);
+				}
+							else
+				{
+					stable_cnt++;
+					HAL_Delay(50);
+				}
+			}
+
+			/* --- 最终微调：误差>1°就再补一刀 --- */
+			error = yaw_desired - yaw;
+			if (my_abs(error) >= 1)
+			{
+				dir = (error > 0) ? 1 : 0;
+				step = (uint16_t)(my_abs(error));
+				if (step < 1) step = 1;
+				Rotate(step, dir);
+				HAL_Delay(100);
+			}
+		}
+		else
+		{
+			/* === IMU无效，走计时模式 === */
+			short ad = angle_desired;
+			if (ad < 0) ad = -ad;
+			Rotate((uint16_t)ad, 0);
+		}
+}
+
+static void PosTarSetVal(int x,int y)
+{
+	Path.pos_tar.x = x;
+	Path.pos_tar.y = y;
+}
+
+static void PosTarSet(void)
+{
+
+	switch (Task.TaskBody[Task.TaskRunIndex].type)
+	{
+		case 'A':
+		case 'w':
+			PosTarSetVal(PLACE_A);
+			break;
+
+		case 'B':
+		case 'x':
+			PosTarSetVal(PLACE_B);
+			break;
+
+		case 'C':
+		case 'y':
+			PosTarSetVal(PLACE_C);
+			break;
+
+		case 'D':
+		case 'z':
+			PosTarSetVal(PLACE_D);
+			break;
+		
+		case 'a':
+		case 'b':
+		case 'c':
+			PosTarSetVal(PLACE_abc);
+			break;
+
+		case 'd':
+		case 'e':
+		case 'f':
+			PosTarSetVal(PLACE_def);
+			break;
+	}
+}
+
+static void PosTarSetBack(void)
+{
+	PosTarSetVal(BFS_START);
+}
+
+static uint8_t PosCp(void)
+{
+	if(Path.pos_tar.x == Path.pos.x && Path.pos_tar.y == Path.pos.y) return 1;
+	else return 0;
+}
+
+static uint8_t RunDir(void)
+{
+	if (Path.pos.x != Path.path[Path.path_index].x)
+	{
+		if (Path.path[Path.path_index].x - Path.pos.x > 0)return RIGHT;
+		else return LEFT;
+	}
+	else
+	{
+		if (Path.path[Path.path_index].y - Path.pos.y > 0)return FRONT;
+		else return BACK;
+	}
+}
+
+static void TaskStateClr(void)
+{
+	Task.TaskIndex = 0;
+	Task.TaskRunIndex = 0;
+	Task.ItemNum = 0;
+	Task.PlaceNum = 0;
+	Task.TaskFlag = None;
+
+}
+
+static void TaskStateUpdate(void)
+{
+	Task.TaskBody[Task.TaskRunIndex].type = 0;
+	Task.TaskBody[Task.TaskRunIndex].val = 0;
+	Task.TaskRunIndex++;
+}
+
+static void PathStateClr(void)
+{
+	Path.path_len = 0;
+	Path.path_index = 1;
+	Path.pos_tar.x = 0;
+	Path.pos_tar.y = 0;
+}
+static void PathStateUpdate(void)
+{
+	// ��ֵ��ǰ���ڵ�λ��
+	Path.pos.x = Path.path[Path.path_index].x;
+	Path.pos.y = Path.path[Path.path_index].y;
+	// ˳�����path
+	Path.path[Path.path_index].x = 0;
+	Path.path[Path.path_index].y = 0;
+	// �ж��Ƿ��������Ǿ͸�������
+	if(Path.path_index < Path.path_len - 1)Path.path_index++;
+}
+
+static void CalPathWithTask(void)
+{
+	CalPath(Path.pos.x,Path.pos.y,Path.pos_tar.x,Path.pos_tar.y);
+}
+
+static uint16_t GetPlate(uint8_t boolbool)
+{
+   for (uint8_t i = 0; i < PLATE_NUM; i++)
+   {
+		// ��ʾ���λ��û�зŶ���
+		if (plate_state[i] == boolbool)
+		{
+			plate_state[i] = !boolbool;
+			switch (i)
+			{
+				case 0:
+					return JOINT1_PLATE1;
+					break;
+
+				case 1:
+					return JOINT1_PLATE2;
+					break;
+
+				case 2:
+					return JOINT1_PLATE3;
+					break;
+			}
+		}
+   }
+   return 0;
+}
+
+static void BackCheck(void)
+{
+	Rotation(0);
+	RunMove(BACK,8,0);
+	Servo_Plate_To_Move(JOINT1_PLATE1);
+	SetCameraTask(CAM_PLACE_HOME);
+	WaitPlace(CAM_PLACE_HOME);
+	Servo_Move_To_Plate(JOINT1_PLATE1);
+}
+
+static void PickUp(void)
+{
+	switch (Task.TaskBody[Task.TaskRunIndex].type)
+	{
+		case 'A':
+			Rotation(0);
+			Servo_Plate_To_Move(JOINT1_PLATE1);
+			SetCameraTask(CAM_PLACE_A);
+			WaitPlace(CAM_PLACE_A);
+
+			SetCameraTask(CAM_ITEM_A_1);
+			WaitPlace(CAM_ITEM_A_1);
+
+			Catch(GetPlate(0));
+
+			SetCameraTask(CAM_PLACE_A);	
+			WaitPlace(CAM_PLACE_A);
+
+			Servo_Move_To_Plate(JOINT1_PLATE1);
+			break;
+		case 'B':
+			Rotation(0);
+			Servo_Plate_To_Move(JOINT1_PLATE1);
+			SetCameraTask(CAM_PLACE_B);
+			WaitPlace(CAM_PLACE_B);
+
+			SetCameraTask(CAM_ITEM_B_1);
+			WaitPlace(CAM_ITEM_B_1);
+
+			Catch(GetPlate(0));
+
+			SetCameraTask(CAM_PLACE_B);	
+			WaitPlace(CAM_PLACE_B);
+
+			Servo_Move_To_Plate(JOINT1_PLATE1);
+			break;
+		case 'C':
+			Rotation(0);
+			Servo_Plate_To_Move(JOINT1_PLATE1);
+			SetCameraTask(CAM_PLACE_C);
+			WaitPlace(CAM_PLACE_C);
+		
+			SetCameraTask(CAM_ITEM_C_1);
+			WaitPlace(CAM_ITEM_C_1);
+
+			Catch(GetPlate(0));
+
+			SetCameraTask(CAM_PLACE_C);	
+			WaitPlace(CAM_PLACE_C);
+
+			Servo_Move_To_Plate(JOINT1_PLATE1);
+			break;
+		case 'D':
+			Rotation(0);
+			Servo_Plate_To_Move(JOINT1_PLATE1);
+			SetCameraTask(CAM_PLACE_D);
+			WaitPlace(CAM_PLACE_D);
+
+			SetCameraTask(CAM_ITEM_D_1);
+			WaitPlace(CAM_ITEM_D_1);
+
+			Catch(GetPlate(0));
+			RunMove(BACK,10,0);
+
+			SetCameraTask(CAM_PLACE_D);	
+			WaitPlace(CAM_PLACE_D);
+
+			Servo_Move_To_Plate(JOINT1_PLATE1);
+			break;
+		
+		case 'a':
+			Rotation(0);
+			Servo_Plate_To_Move(JOINT1_PLATE1);
+
+			SetCameraTask(CAM_PLACE_abc);
+			WaitPlace(CAM_PLACE_abc);
+
+			RunMove(LEFT,INTERVAL_DIS,0);
+			RunMove(FRONT,10,0);
+
+			SetCameraTask(CAM_PLACE_a);
+			WaitPlace(CAM_PLACE_a);
+
+			Place(GetPlate(1));
+
+			RunMove(BACK,10,0);
+			RunMove(RIGHT,INTERVAL_DIS,0);
+
+			SetCameraTask(CAM_PLACE_abc);	
+			WaitPlace(CAM_PLACE_abc);
+
+			Servo_Move_To_Plate(JOINT1_PLATE1);
+			break;
+		case 'b':
+			Rotation(0);
+			Servo_Plate_To_Move(JOINT1_PLATE1);
+
+			SetCameraTask(CAM_PLACE_abc);
+			WaitPlace(CAM_PLACE_abc);
+
+			RunMove(FRONT,10,0);
+
+			SetCameraTask(CAM_PLACE_b);
+			WaitPlace(CAM_PLACE_b);
+
+			Place(GetPlate(1));
+
+			RunMove(BACK,10,0);
+
+			SetCameraTask(CAM_PLACE_abc);	
+			WaitPlace(CAM_PLACE_abc);
+
+			Servo_Move_To_Plate(JOINT1_PLATE1);
+			break;
+		case 'c':
+			Rotation(0);
+			Servo_Plate_To_Move(JOINT1_PLATE1);
+
+			SetCameraTask(CAM_PLACE_abc);
+			WaitPlace(CAM_PLACE_abc);
+
+			RunMove(RIGHT,INTERVAL_DIS,0);
+			RunMove(FRONT,10,0);
+
+			SetCameraTask(CAM_PLACE_c);
+			WaitPlace(CAM_PLACE_c);
+
+			Place(GetPlate(1));
+
+			RunMove(BACK,10,0);
+			RunMove(LEFT,INTERVAL_DIS,0);
+
+			SetCameraTask(CAM_PLACE_abc);	
+			WaitPlace(CAM_PLACE_abc);
+
+			Servo_Move_To_Plate(JOINT1_PLATE1);
+			break;
+
+		case 'd':
+			Rotation(-90);
+			RunMove(FRONT,10,0);
+
+			SetCameraTask(CAM_PLACE_def);
+			WaitPlace(CAM_PLACE_def);
+
+			RunMove(LEFT,INTERVAL_DIS,0);		
+
+			SetCameraTask(CAM_PLACE_d);
+			WaitPlace(CAM_PLACE_d);
+
+			Place(GetPlate(1));
+
+			Servo_Move_To_Plate(JOINT1_PLATE1);
+
+			RunMove(RIGHT,INTERVAL_DIS,0);
+
+			break;
+		case 'e':
+			Rotation(-90);
+			RunMove(FRONT,10,0);
+
+			SetCameraTask(CAM_PLACE_def);
+			WaitPlace(CAM_PLACE_def);
+
+			SetCameraTask(CAM_PLACE_e);
+			WaitPlace(CAM_PLACE_e);
+
+			Place(GetPlate(1));
+
+			Servo_Move_To_Plate(JOINT1_PLATE1);
+			break;
+		case 'f':
+			Rotation(-90);
+			RunMove(FRONT,10,0);
+
+			SetCameraTask(CAM_PLACE_def);
+			WaitPlace(CAM_PLACE_def);
+
+			RunMove(RIGHT,INTERVAL_DIS,0);	
+
+			SetCameraTask(CAM_PLACE_f);
+			WaitPlace(CAM_PLACE_f);
+
+			Place(GetPlate(1));
+
+			Servo_Move_To_Plate(JOINT1_PLATE1);
+
+			RunMove(LEFT,INTERVAL_DIS,0);
+			break;
+
+		case 'w':
+		case 'x':
+		case 'y':
+		case 'z':
+			Rotation(0);
+			Servo_Plate_To_Move(JOINT1_PLATE1);
+			SetCameraTask(CAM_PLACE_A);
+			WaitPlace(CAM_PLACE_A);
+
+			reset_detector(&detector);
+			SetCameraTask(CAM_YOLO);
+			WaitYolo();
+
+			SetCameraTask(CAM_PLACE_A);	
+			WaitPlace(CAM_PLACE_A);
+
+			Servo_Move_To_Plate(JOINT1_PLATE1);
+			break;
+	}
+}
+
+void RunMap(void)
+{
+	if (!PosCp())	// ��ͼ
+	{
+		CalPathWithTask();
+		while (!PosCp())
+		{
+			RunMove(RunDir(),UNIT_DIS,1);
+			RotationCheck();	
+			PathStateUpdate();	
+		}
+		PathStateClr();
+	}
+}
+
+void RunTask(void)
+{
+	PickUp();
+	TaskStateUpdate();
+}
+
+/*
+ * === 新版 Procesing：区分搬运/巡检/回航 ===
+ * 搬运模式(ItemNum>0)：导航到地点 + 抓取物品
+ * 巡检模式(ItemNum==0)：只导航到地点，不抓取
+ */
+static void InspectTask(void)
+{
+	TaskStateUpdate();
+}
+
+void Procesing(void)
+{	
+	if(Task.TaskFlag == Start)
+	{
+		if (Task.ItemNum + Task.PlaceNum != 0)
+		{
+			if(Task.TaskRunIndex < Task.ItemNum + Task.PlaceNum)
+			{
+				PosTarSet();
+				RunMap();
+				if (Task.ItemNum > 0)
+					RunTask();       // 搬运：导航 + 抓取
+				else
+					InspectTask();   // 巡检：仅导航
+			}
+			else	// 全部完成，返回起点
+			{
+				PosTarSetBack();
+				RunMap();
+				BackCheck();
+				TaskStateClr();
+			}
+		}
+	}
+}

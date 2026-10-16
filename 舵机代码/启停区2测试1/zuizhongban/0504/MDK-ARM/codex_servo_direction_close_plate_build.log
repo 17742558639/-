@@ -1,0 +1,21 @@
+*** Using Compiler 'V5.06 update 5 (build 528)', folder: 'C:\Keil_v5\ARM\ARMCC\Bin'
+Build target 'test1'
+compiling servo.c...
+..\Models\Src\servo.c(410): warning:  #186-D: pointless comparison of unsigned integer with zero
+    for(uint8_t i = 0;i < 
+OINT3_MOVE - 
+OINT3_WATCH;i +=2)
+..\Models\Src\servo.c(423): warning:  #186-D: pointless comparison of unsigned integer with zero
+    for(uint8_t i = 0;i < 
+OINT3_MOVE - 
+OINT3_WATCH;i +=2)
+..\Models\Src\servo.c(626): warning:  #514-D: pointless comparison of unsigned integer with a negative constant
+    for(uint8_t i = 0;i < 
+OINT3_CATCH - 
+OINT3_WATCH;i +=2)
+..\Models\Src\servo.c: 3 warnings, 0 errors
+linking...
+Program Size: Code=20588 RO-data=504 RW-data=484 ZI-data=4476  
+FromELF: creating hex file...
+"test1\test1.axf" - 0 Error(s), 3 Warning(s).
+Build Time Elapsed:  00:00:02
